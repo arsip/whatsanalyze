@@ -76,6 +76,8 @@
 import { parseString } from "whatsapp-chat-parser";
 import JSZip from "jszip";
 import { GTAG_FILE, gtagEvent } from "~/utils/gtagValues";
+import { storeWhatsAppChat } from '~/server/db';
+import { wrap } from 'comlink';
 
 export default {
   name: "FileHandler",
@@ -86,101 +88,138 @@ export default {
       processing: false,
       isSuccess: false,
       attachments: {},
+      duckDBWorker: null,
+      zipWorker: null
     };
   },
+  async created() {
+    // Initialize workers
+    this.duckDBWorker = wrap(new Worker(new URL('../wasm/duckdb.worker.js', import.meta.url), { type: 'module' }));
+    this.zipWorker = wrap(new Worker(new URL('../wasm/zip.worker.js', import.meta.url), { type: 'module' }));
+
+    // Initialize DuckDB tables
+    await this.duckDBWorker.createTables();
+  },
   methods: {
-    extendDataStructure(chatObject) {
+    async extendDataStructure(chatObject) {
       let authors = {};
+      let participants = {};
+
       chatObject.messages.forEach(function (object, index) {
-        if (!(object.author in authors)) authors[object.author] = 0;
-        else authors[object.author] += 1;
+        if (!(object.author in authors)) {
+          authors[object.author] = 0;
+          participants[object.author] = {
+            messageCount: 1,
+            firstMessage: object.date,
+            lastMessage: object.date
+          };
+        } else {
+          authors[object.author] += 1;
+          participants[object.author].messageCount += 1;
+          participants[object.author].lastMessage = object.date;
+        }
         object.absolute_id = index;
         object.personal_id = authors[object.author];
       });
-    },
 
-    zipLoadEndHandler(e) {
-      const arrayBuffer = e.target.result;
-      const jszip = new JSZip();
-      const zip = jszip.loadAsync(arrayBuffer);
+      // Store data in DuckDB
+      try {
+        await this.duckDBWorker.insertData(
+          chatObject.messages.map((msg, id) => ({
+            id,
+            author: msg.author,
+            message: msg.message,
+            date: msg.date,
+            hasMedia: msg.message.includes('<media omitted>'),
+            mediaType: msg.message.includes('<media omitted>') ? this.detectMediaType(msg.message) : null,
+            location: msg.message.includes('location:') ? { url: msg.message } : null
+          })),
+          participants
+        );
 
-      zip
-        .then((zipData) => {
-          let chatFile = this.getChatFile(zipData);
-          return parseString(chatFile, {
-            parseAttachments: true,
-          }).then((messages) => {
-            return {
-              messages: messages,
-              // we just pass a list of filenames with compressed contents here
-              attachments: Object.values(zipData.files).map((file) => {
-                return {
-                  name: file.name,
-                  compressedContent: file._data.compressedContent,
-                };
-              }),
-            };
-          });
-        })
-        .then(this.updateMessages);
-    },
+        // Get comprehensive analysis
+        const [
+          chatSummary,
+          messagesByParticipant,
+          wordCountStats,
+          messagesByHour,
+          messagesByDayOfWeek,
+          mostActiveDays,
+          topEmojis,
+          mediaStats,
+          activityTrends,
+          conversationPeaks
+        ] = await Promise.all([
+          this.duckDBWorker.getChatSummary(),
+          this.duckDBWorker.getMessageCountByParticipant(),
+          this.duckDBWorker.getWordCountStats(),
+          this.duckDBWorker.getMessageFrequencyByHour(),
+          this.duckDBWorker.getMessageFrequencyByDayOfWeek(),
+          this.duckDBWorker.getMostActiveDays(10),
+          this.duckDBWorker.getTopEmojis(10),
+          this.duckDBWorker.getMediaStatistics(),
+          this.duckDBWorker.getActivityTrends(),
+          this.duckDBWorker.getConversationPeaks()
+        ]);
 
-    async getChatFile(zipData) {
-      // this is the standard file on ios, if found return
-      const chatFile = zipData.file("_chat.txt");
-      if (chatFile) return chatFile.async("string");
-
-      // otherwise search for potential other txt files
-      // take shortes one
-      return await zipData
-        .file(/.*(?:chat|whatsapp).*\.txt$/i)
-        .sort((a, b) => a.name.length - b.name.length)[0]
-        .async("string");
-    },
-
-    readFileAsArrayBuffer(file) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(new Uint8Array(reader.result));
-        reader.onerror = reject;
-        reader.readAsArrayBuffer(file);
-      });
-    },
-
-    readSharedFiles(files) {
-      function findChatFile(files) {
-        let chatRegex = new RegExp(/.*(?:chat|whatsapp).*\.txt$/i);
-        return files.find((file) => {
-          return chatRegex.test(file.name);
+        // Emit analysis results
+        this.$emit('analysis_results', {
+          chatSummary,
+          messagesByParticipant,
+          wordCountStats,
+          messagesByHour,
+          messagesByDayOfWeek,
+          mostActiveDays,
+          topEmojis,
+          mediaStats,
+          activityTrends,
+          conversationPeaks
         });
-      }
 
-      files = Array.from(files);
-      let chatFile = findChatFile(files);
-      if (chatFile === undefined) {
+      } catch (error) {
+        console.error('Error analyzing chat data:', error);
+      }
+    },
+
+    detectMediaType(message) {
+      const mediaTypes = {
+        'image omitted': 'image',
+        'video omitted': 'video',
+        'audio omitted': 'audio',
+        'sticker omitted': 'sticker',
+        'GIF omitted': 'gif',
+        'document omitted': 'document'
+      };
+
+      for (const [pattern, type] of Object.entries(mediaTypes)) {
+        if (message.toLowerCase().includes(pattern)) {
+          return type;
+        }
+      }
+      return 'other';
+    },
+
+    async zipLoadEndHandler(e) {
+      try {
+        const { chatContent, attachments } = await this.zipWorker.processZipContent({
+          files: Array.from(e.target.files).map(file => ({
+            name: file.name,
+            data: file.arrayBuffer()
+          }))
+        });
+
+        const messages = await parseString(chatContent, { parseAttachments: true });
+        this.updateMessages({
+          messages,
+          attachments: attachments.map(att => ({
+            name: att.name,
+            decompressedData: att.data
+          }))
+        });
+      } catch (error) {
+        console.error('Error processing ZIP file:', error);
         this.showErrorMessage();
-        return;
       }
-      const reader = new FileReader();
-      reader.addEventListener("loadend", (loadedFile) => {
-        parseString(loadedFile.target.result, {
-          parseAttachments: true,
-        }).then(async (messages) => {
-          // the only difference to the zip file is, that these blobs are already inflated
-          let attachments = [];
-          // we would like to have all files as uint8arrays, as such we have to read the file in as array
-          await files.forEach(async (file) => {
-            const arr = await this.readFileAsArrayBuffer(file);
-            attachments.push({ name: file.name, decompressedData: arr });
-          });
-
-          this.updateMessages({
-            messages: messages,
-            attachments,
-          });
-        });
-      });
-      reader.readAsText(chatFile);
     },
 
     txtLoadEndHandler(e) {

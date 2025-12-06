@@ -1,0 +1,16 @@
+ignoredBuiltDependencies:
+  - node-duckdb
+onlyBuiltDependencies:
+  - '@firebase/util'
+  - '@sentry/cli'
+  - core-js
+  - deasync
+  - duckdb
+  - es5-ext
+  - fsevents
+  - husky
+  - iltorb
+  - nuxt
+  - protobufjs
+  - re2
+  - unrs-resolver
